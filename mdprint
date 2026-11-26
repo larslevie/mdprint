@@ -23,6 +23,7 @@ STYLE = r"""// mdprint default style.
 // `#show: mdprint` before the Markdown is rendered. mdprint passes these
 // string inputs, read via `sys.inputs`:
 //   paper           "us-letter" | "a4"
+//   landscape       "true" | "false"   long edge horizontal
 //   highlight       "true" | "false"   syntax highlighting in code blocks
 //   color           "true" | "false"   on-screen color theme
 //   link-footnotes  "true" | "false"   append link URLs as footnotes
@@ -171,6 +172,7 @@ STYLE = r"""// mdprint default style.
   set document(title: title) if title != none
   set page(
     paper: sys.inputs.at("paper", default: "us-letter"),
+    flipped: flag("landscape"),
     margin: (x: 1.1in, y: 1in),
     footer: context {
       let total = counter(page).final().first()
@@ -262,7 +264,7 @@ each rendered to its own PDF and printed as its own job, in path order.
   -P, --printer NAME       Printer queue or display name, loosely matched (implies --print;
                            default: system default, else macOS last-used printer)
   -n, --copies N           Number of copies (default 1)
-  -d, --duplex             Two-sided printing (-o sides=two-sided-long-edge)
+  -d, --duplex             Two-sided printing, bound on the long edge (short edge if landscape)
   -o, --output PATH        Keep the PDF at PATH (otherwise it lives in a temp dir);
                            for a directory, PATH is a directory mirroring its layout
   -r, --recursive          Include subdirectories when PATH is a directory
@@ -271,6 +273,7 @@ each rendered to its own PDF and printed as its own job, in path order.
       --open               Open the PDF in the default viewer
   -s, --style FILE.typ     Use this Typst style file instead of the embedded default
       --paper SIZE         us-letter (default) | a4
+  -l, --landscape          Landscape pages (with --duplex, binds on the short edge)
       --link-footnotes     Put link URLs in footnotes (default ON when printing, OFF otherwise)
       --no-link-footnotes  Disable link footnotes even when printing
       --highlight          Enable syntax highlighting in code blocks
@@ -304,6 +307,7 @@ def parse_args(argv):
     p.add_argument("--open", action="store_true")
     p.add_argument("-s", "--style")
     p.add_argument("--paper", choices=["us-letter", "a4"], default="us-letter")
+    p.add_argument("-l", "--landscape", action="store_true")
     p.add_argument("--link-footnotes", dest="link_footnotes", action="store_true", default=None)
     p.add_argument("--no-link-footnotes", dest="link_footnotes", action="store_false")
     p.add_argument("--highlight", action="store_true")
@@ -465,7 +469,9 @@ def send_to_printer(pdf, args, job_title):
     if args.printer:
         cmd += ["-d", args.printer]
     if args.duplex:
-        cmd += ["-o", "sides=two-sided-long-edge"]
+        # Landscape pages flip like a book when bound on the paper's short edge.
+        edge = "short" if args.landscape else "long"
+        cmd += ["-o", f"sides=two-sided-{edge}-edge"]
     return subprocess.run(cmd + [str(pdf)]).returncode == 0
 
 
@@ -500,6 +506,7 @@ def render(src, pdf, args, workdir, style):
     inputs = {
         "base": str(src.parent),
         "paper": args.paper,
+        "landscape": str(args.landscape).lower(),
         "highlight": str(args.highlight).lower(),
         "color": str(args.color).lower(),
         "link-footnotes": str(args.link_footnotes).lower(),
