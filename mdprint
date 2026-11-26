@@ -275,11 +275,14 @@ each rendered to its own PDF and printed as its own job, in path order.
       --no-link-footnotes  Disable link footnotes even when printing
       --highlight          Enable syntax highlighting in code blocks
       --color              Screen-oriented color theme: dark-blue links, highlighted code
+      --raw-typst          Run Typst code embedded in the Markdown (only for trusted files)
       --print-style        Write the embedded default style to stdout
   -h, --help
 
 Code blocks fenced as ```mermaid are drawn as diagrams, as are unlabeled
 fences that start with a Mermaid diagram type (flowchart, sequenceDiagram, ...).
+
+Images must be relative paths inside the Markdown file's directory.
 
 With no flags, renders to a temp dir and opens the PDF for preview.
 Requires typst (brew install typst); printing also needs lp (CUPS).
@@ -308,6 +311,7 @@ def parse_args(argv):
     p.add_argument("--no-link-footnotes", dest="link_footnotes", action="store_false")
     p.add_argument("--highlight", action="store_true")
     p.add_argument("--color", action="store_true")
+    p.add_argument("--raw-typst", action="store_true")
     p.add_argument("--print-style", action="store_true")
     p.add_argument("-h", "--help", action="store_true")
     p.error = lambda msg: die(f"{msg}\nTry 'mdprint --help'.", 2)
@@ -347,17 +351,19 @@ def typst_str(s):
     return json.dumps(s, ensure_ascii=False)
 
 
-def wrapper(style_path, body_path):
-    # Root is "/", so absolute host paths double as root-relative Typst paths.
+def wrapper(style_import, raw_typst):
+    # Paths are relative to the sandbox root; Typst rejects any that escape it.
     return f"""#import {typst_str(CMARKER)}: render
-#import {typst_str(str(style_path))}: mdprint
+#import {typst_str(style_import)}: mdprint
 #show: mdprint
 
-#let base = sys.inputs.base
-#let resolve(src) = if src.starts-with("/") {{ src }} else {{ base + "/" + src }}
+#let resolve(src) = if src.starts-with("/") {{
+  panic("absolute image paths are not allowed: " + src)
+}} else {{ "/src/" + src }}
 
 #render(
-  read({typst_str(str(body_path))}),
+  read("/body.md"),
+  raw-typst: {str(raw_typst).lower()},
   scope: (image: (src, ..args) => image(resolve(src), ..args)),
 )
 """
@@ -490,15 +496,17 @@ def collect_sources(path, recursive):
 def render(src, pdf, args, workdir, style):
     """Compiles SRC to PDF; returns the front-matter title, or False on failure."""
     title, body = split_front_matter(src.read_text(encoding="utf-8"))
+    # WORKDIR is the Typst root, so the Markdown can read only its own
+    # directory (via /src) and the style's (via /style).
     workdir.mkdir()
-    body_path = workdir / "body.md"
-    body_path.write_text(BARE_ANCHOR.sub(r"<figure id=\1></figure>", body), encoding="utf-8")
+    (workdir / "src").symlink_to(src.parent, target_is_directory=True)
+    (workdir / "style").symlink_to(style.parent, target_is_directory=True)
+    (workdir / "body.md").write_text(BARE_ANCHOR.sub(r"<figure id=\1></figure>", body), encoding="utf-8")
     main = workdir / "main.typ"
-    main.write_text(wrapper(style, body_path), encoding="utf-8")
+    main.write_text(wrapper(f"/style/{style.name}", args.raw_typst), encoding="utf-8")
     pdf.parent.mkdir(parents=True, exist_ok=True)
 
     inputs = {
-        "base": str(src.parent),
         "paper": args.paper,
         "highlight": str(args.highlight).lower(),
         "color": str(args.color).lower(),
@@ -508,7 +516,7 @@ def render(src, pdf, args, workdir, style):
     }
     if title:
         inputs["title"] = title
-    cmd = ["typst", "compile", "--root", "/"]
+    cmd = ["typst", "compile", "--root", str(workdir)]
     for k, v in inputs.items():
         cmd += ["--input", f"{k}={v}"]
     # Streamed so first-run package download progress shows as it happens.
@@ -543,7 +551,8 @@ def run(args, workdir):
         if not style.is_file():
             die(f"no such style file: {args.style}")
     else:
-        style = workdir / "style.typ"
+        style = workdir / "default-style" / "style.typ"
+        style.parent.mkdir()
         style.write_text(STYLE, encoding="utf-8")
 
     # A directory's layout is mirrored, so same-named files can't collide.
