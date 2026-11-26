@@ -63,6 +63,10 @@ STYLE = r"""// mdprint default style.
 // Rebuilds a table to span the text width. Columns grow in proportion to
 // their content's natural width; when that overflows, columns narrower than
 // an even share keep their natural width and the rest split what remains.
+//
+// Tables in a column group (the `mdprint-columns` state) size each column to
+// its widest cell across every group table with the same column count, so
+// their columns line up.
 #let fixed-columns(it) = it.columns.all(c => type(c) in (fraction, length, relative))
 
 #let full-width(it) = {
@@ -71,14 +75,21 @@ STYLE = r"""// mdprint default style.
   let cells = it.children
     .map(c => if c.func() == table.header { c.children } else { (c,) })
     .flatten()
-  layout(size => {
+  context layout(size => {
     let inset = 12pt
-    let widths = range(n).map(i => inset + calc.max(
+    let own = range(n).map(i => inset + calc.max(
       ..cells.enumerate()
         .filter(((j, _)) => calc.rem(j, n) == i)
         .map(((_, c)) => measure(if c.func() == table.cell { c.body } else { c }).width),
       1pt,
     ))
+    let group = state("mdprint-columns").get()
+    let key = if group != none { group + "/" + str(n) }
+    if key != none [#metadata((key: key, widths: own))<mdprint-columns>]
+    let widths = if key == none { own } else {
+      let peers = query(<mdprint-columns>).map(m => m.value).filter(v => v.key == key)
+      range(n).map(i => calc.max(own.at(i), ..peers.map(v => v.widths.at(i))))
+    }
     let total = widths.sum()
     let columns = if total <= size.width {
       widths.map(w => (w / total) * 1fr)
@@ -284,6 +295,10 @@ each rendered to its own PDF and printed as its own job, in path order.
 Code blocks fenced as ```mermaid are drawn as diagrams, as are unlabeled
 fences that start with a Mermaid diagram type (flowchart, sequenceDiagram, ...).
 
+To line up the columns of several tables, put `<!-- mdprint: columns NAME -->`
+before them. Tables after it with the same number of columns share column
+widths, up to the next such comment; `<!-- mdprint: columns -->` ends the group.
+
 With no flags, renders to a temp dir and opens the PDF for preview.
 Requires typst (brew install typst); printing also needs lp (CUPS).
 """
@@ -344,6 +359,20 @@ def split_front_matter(text):
 # cmarker crashes on <a> tags lacking href and only labels headings and figures
 # by id, so empty <a id> anchors become empty figures to keep #id links valid.
 BARE_ANCHOR = re.compile(r"<a\s+id=(\"[^\"]*\")\s*>\s*</a>", re.I)
+
+# `<!-- mdprint: columns NAME -->` puts the tables after it in column group
+# NAME, up to the next such comment; with no NAME, it ends the group.
+COLUMNS_DIRECTIVE = re.compile(r"<!--\s*mdprint:\s*columns(?:\s+(\S+))?\s*-->")
+
+
+def columns_directive(m):
+    group = typst_str(m.group(1)) if m.group(1) else "none"
+    return f'<!--raw-typst #state("mdprint-columns").update({group})-->'
+
+
+def preprocess(body):
+    body = BARE_ANCHOR.sub(r"<figure id=\1></figure>", body)
+    return COLUMNS_DIRECTIVE.sub(columns_directive, body)
 
 
 def typst_str(s):
@@ -498,7 +527,7 @@ def render(src, pdf, args, workdir, style):
     title, body = split_front_matter(src.read_text(encoding="utf-8"))
     workdir.mkdir()
     body_path = workdir / "body.md"
-    body_path.write_text(BARE_ANCHOR.sub(r"<figure id=\1></figure>", body), encoding="utf-8")
+    body_path.write_text(preprocess(body), encoding="utf-8")
     main = workdir / "main.typ"
     main.write_text(wrapper(style, body_path), encoding="utf-8")
     pdf.parent.mkdir(parents=True, exist_ok=True)
