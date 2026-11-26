@@ -80,7 +80,10 @@ STYLE = r"""// mdprint default style.
     let own = range(n).map(i => inset + calc.max(
       ..cells.enumerate()
         .filter(((j, _)) => calc.rem(j, n) == i)
-        .map(((_, c)) => measure(if c.func() == table.cell { c.body } else { c }).width),
+        // Placed cells pick up position-based rules, such as a bold header.
+        .map(((j, c)) => measure(table.cell(
+          x: i, y: calc.quo(j, n), if c.func() == table.cell { c.body } else { c },
+        )).width),
       1pt,
     ))
     let group = state("mdprint-columns").get()
