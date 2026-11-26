@@ -1,0 +1,614 @@
+#!/usr/bin/env python3
+"""mdprint: Markdown -> typeset PDF (Typst + cmarker) -> optionally a printer."""
+
+import argparse
+import json
+import os
+import plistlib
+import platform
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+CMARKER = "@preview/cmarker:0.1.10"
+MARKDOWN_SUFFIXES = {".md", ".markdown"}
+
+STYLE = r"""// mdprint default style.
+//
+// A style is a Typst module exporting `mdprint(body)`, applied with
+// `#show: mdprint` before the Markdown is rendered. mdprint passes these
+// string inputs, read via `sys.inputs`:
+//   paper           "us-letter" | "a4"
+//   highlight       "true" | "false"   syntax highlighting in code blocks
+//   color           "true" | "false"   on-screen color theme
+//   link-footnotes  "true" | "false"   append link URLs as footnotes
+//   title           front-matter title (absent when there is none)
+//   show-title      "true" | "false"   typeset the title above the body
+//   filename        source file name, for when there is no title
+
+#import "@preview/merman:0.5.0": mermaid
+
+#let flag(key) = sys.inputs.at(key, default: "false") == "true"
+
+#let serif = ("Libertinus Serif", "Source Serif 4", "Georgia", "New Computer Modern")
+#let mono = ("JetBrains Mono", "Menlo", "DejaVu Sans Mono")
+
+#let plain(c) = {
+  if type(c) == str { c }
+  else if c.has("text") { c.text }
+  else if c.has("children") { c.children.map(plain).join(default: "") }
+  else if c.has("body") { plain(c.body) }
+  else { "" }
+}
+
+// Footnotes a link's URL unless its text already is the URL. Repeat links to
+// a URL reuse its first footnote; keying on page would make the label set
+// depend on layout and keep the document from converging.
+#let url-footnote(it) = {
+  let url = it.dest
+  let shown = plain(it.body)
+  if shown == url or shown == url.replace(regex("^(https?://|mailto:)"), "") { return }
+  context {
+    let name = "mdprint-fn-" + url
+    let first = query(selector(label(name)).before(here()))
+    if first.len() == 0 { [#footnote(raw(url))#label(name)] } else { footnote(label(name)) }
+  }
+}
+
+// Rebuilds a table to span the text width. Columns grow in proportion to
+// their content's natural width; when that overflows, columns narrower than
+// an even share keep their natural width and the rest split what remains.
+#let fixed-columns(it) = it.columns.all(c => type(c) in (fraction, length, relative))
+
+#let full-width(it) = {
+  if fixed-columns(it) { return it }
+  let n = it.columns.len()
+  let cells = it.children
+    .map(c => if c.func() == table.header { c.children } else { (c,) })
+    .flatten()
+  layout(size => {
+    let inset = 12pt
+    let widths = range(n).map(i => inset + calc.max(
+      ..cells.enumerate()
+        .filter(((j, _)) => calc.rem(j, n) == i)
+        .map(((_, c)) => measure(if c.func() == table.cell { c.body } else { c }).width),
+      1pt,
+    ))
+    let total = widths.sum()
+    let columns = if total <= size.width {
+      widths.map(w => (w / total) * 1fr)
+    } else {
+      let wide = widths.map(w => w > size.width / n)
+      let wide-total = widths.zip(wide).filter(((_, x)) => x).map(((w, _)) => w).sum()
+      widths.zip(wide).map(((w, x)) => if x { (w / wide-total) * 1fr } else { w })
+    }
+    let fields = it.fields()
+    let _ = fields.remove("children")
+    fields.columns = columns
+    table(..fields, ..it.children)
+  })
+}
+
+// Lists may break across pages but never strand a single item: the first two
+// and last two items stay together. Short lists don't break at all.
+#let keep-list-ends(it) = {
+  if it.at("label", default: none) == <mdprint-list-part> { return it }
+  let items = it.children
+  let n = items.len()
+  if n <= 4 { return block(breakable: false, it) }
+  let is-enum = it.func() == enum
+  let first = if is-enum and it.start != auto { it.start } else { 1 }
+  context {
+    let fields = it.fields()
+    let _ = fields.remove("children")
+    if is-enum {
+      // Each part would size its number column to its own widest number.
+      let format = fields.numbering
+      let width = calc.max(..range(first, first + n).map(k => measure(numbering(format, k)).width))
+      fields.numbering = k => box(width: width, align(end, numbering(format, k)))
+    }
+    let part(from, to) = {
+      let start = if is-enum { (start: first + from) } else { (:) }
+      [#(it.func())(..fields, ..start, ..items.slice(from, to))<mdprint-list-part>]
+    }
+    let gap = if it.spacing != auto { it.spacing } else if it.tight { par.leading } else { par.spacing }
+    let group(from, to, breakable) = block(breakable: breakable, above: gap, below: gap, part(from, to))
+    block(above: par.spacing, below: par.spacing, {
+      group(0, 2, false)
+      group(2, n - 2, true)
+      group(n - 2, n, false)
+    })
+  }
+}
+
+// A fence is a diagram when it opens with a Mermaid diagram type, after any
+// front matter and `%%` comment or directive lines. Untagged fences must have a
+// whole header line, such as `flowchart LR`; a `mermaid` tag is trusted with
+// just the keyword. Anything else, such as box-drawing art, stays code.
+#let mermaid-type = (
+  "^\\s*(---\\n[\\s\\S]*?\\n---[ \\t]*\\n\\s*)?(%%.*\\n\\s*)*"
+  + "(graph|flowchart|sequenceDiagram|classDiagram|stateDiagram|erDiagram|journey|gantt|pie"
+  + "|quadrantChart|requirementDiagram|gitGraph|C4\\w+|mindmap|timeline|kanban|zenuml"
+  + "|sankey|xychart|block|packet|architecture|radar|treemap|venn)(-\\w+)?"
+)
+#let mermaid-keyword = regex(mermaid-type + "\\b")
+#let mermaid-header = regex(
+  mermaid-type
+  + "([ \\t]+(TB|TD|BT|RL|LR|horizontal|vertical))?([ \\t]+(title|showData)\\b.*)?[ \\t]*(;|\\n|$)",
+)
+#let is-mermaid(it) = (
+  (it.lang == "mermaid" and it.text.starts-with(mermaid-keyword))
+    or (it.lang == none and it.text.starts-with(mermaid-header))
+)
+
+// Mermaid's neutral theme is its grayscale one, meant for print. A bad diagram
+// typesets as an error box rather than failing the whole document.
+#let diagram(source, color) = align(center, block(breakable: false, {
+  // Labels take the body font, not the code font raw blocks set.
+  set text(font: serif, size: 10pt)
+  mermaid(
+    source,
+    document-context: true,
+    theme-name: if color { "default" } else { "neutral" },
+    error-mode: "placeholder",
+  )
+}))
+
+// A paragraph ending in a colon introduces what follows, so it stays with it.
+#let keep-lead-in(it) = {
+  if not plain(it.body).trim().ends-with(":") { return it }
+  context block(sticky: true, above: par.spacing, below: par.spacing, it)
+}
+
+#let mdprint(body) = {
+  let color = flag("color")
+  let title = sys.inputs.at("title", default: none)
+
+  set document(title: title) if title != none
+  set page(
+    paper: sys.inputs.at("paper", default: "us-letter"),
+    margin: (x: 1.1in, y: 1in),
+    footer: context {
+      let total = counter(page).final().first()
+      if total > 1 {
+        set text(size: 9pt, fill: luma(25%), hyphenate: false)
+        set par(justify: false)
+        let h1 = query(heading.where(level: 1))
+        let name = if title != none { title } else if h1.len() > 0 { h1.first().body } else {
+          sys.inputs.at("filename", default: "")
+        }
+        grid(columns: (1fr, auto), column-gutter: 1em, name, [#here().page() of #total])
+      }
+    },
+  )
+  set text(font: serif, size: 11pt, lang: "en", hyphenate: true)
+  set par(justify: true, leading: 0.65em, spacing: 0.9em)
+
+  show heading: set text(weight: "semibold", fill: black)
+  show heading: set par(justify: false)
+  show heading: set block(sticky: true, above: 1.4em, below: 0.7em)
+  show heading.where(level: 1): set text(size: 1.6em)
+  show heading.where(level: 2): set text(size: 1.3em)
+  show heading.where(level: 3): set text(size: 1.1em)
+  show heading: it => block(it.body)
+
+  show list: keep-list-ends
+  show enum: keep-list-ends
+  show par: keep-lead-in
+
+  set raw(theme: none) if not (color or flag("highlight"))
+  show raw: set text(font: mono, size: 9pt, features: (calt: 0))
+  show raw.where(block: true): set par(justify: false)
+  show raw.where(block: true): it => block(
+    width: 100%,
+    inset: 7pt,
+    radius: 2pt,
+    fill: if color { rgb("#f3f6fb") } else { luma(97%) },
+    stroke: 0.5pt + if color { rgb("#c9d3e3") } else { luma(60%) },
+    it,
+  )
+  show raw.where(block: true): it => if is-mermaid(it) { diagram(it.text, color) } else { it }
+
+  show link: it => {
+    if type(it.dest) != str { return it }
+    let styled = if color {
+      text(fill: rgb("#1a3d8f"), it)
+    } else {
+      underline(stroke: 0.5pt, offset: 2pt, it)
+    }
+    styled
+    if flag("link-footnotes") { url-footnote(it) }
+  }
+
+  set table(
+    stroke: (_, y) => if y == 0 { (bottom: 0.5pt) } else if y > 1 { (top: 0.25pt + luma(80%)) },
+    inset: (x: 6pt, y: 8pt),
+  )
+  show table.cell.where(y: 0): set text(weight: "bold")
+  show table: set par(justify: false)
+  show table: full-width
+  // full-width re-emits tables with fixed columns; rule only that final pass.
+  show table: it => if fixed-columns(it) { block(stroke: (y: 1pt), it) } else { it }
+
+  show quote.where(block: true): it => block(
+    stroke: (left: 1.5pt + black),
+    inset: (left: 10pt, y: 3pt),
+    text(fill: luma(30%), it.body),
+  )
+
+  show image: it => align(center, it)
+
+  if title != none and flag("show-title") {
+    align(center, block(below: 1.8em, text(
+      weight: "semibold", size: 2em, hyphenate: false, title,
+    )))
+  }
+  body
+}
+"""
+
+HELP = """\
+usage: mdprint PATH [options]
+
+Typeset Markdown to PDF with Typst; preview it, or print it. PATH is a
+Markdown file or a directory of them (*.md, *.markdown; hidden files skipped),
+each rendered to its own PDF and printed as its own job, in path order.
+
+  -p, --print              Send to printer after rendering (via `lp`), then delete the PDF
+  -P, --printer NAME       Printer queue or display name, loosely matched (implies --print;
+                           default: system default, else macOS last-used printer)
+  -n, --copies N           Number of copies (default 1)
+  -d, --duplex             Two-sided printing (-o sides=two-sided-long-edge)
+  -o, --output PATH        Keep the PDF at PATH (otherwise it lives in a temp dir);
+                           for a directory, PATH is a directory mirroring its layout
+  -r, --recursive          Include subdirectories when PATH is a directory
+      --title              Typeset the front-matter title above the body
+                           (it always sets the PDF title and print job name)
+      --open               Open the PDF in the default viewer
+  -s, --style FILE.typ     Use this Typst style file instead of the embedded default
+      --paper SIZE         us-letter (default) | a4
+      --link-footnotes     Put link URLs in footnotes (default ON when printing, OFF otherwise)
+      --no-link-footnotes  Disable link footnotes even when printing
+      --highlight          Enable syntax highlighting in code blocks
+      --color              Screen-oriented color theme: dark-blue links, highlighted code
+      --print-style        Write the embedded default style to stdout
+  -h, --help
+
+Code blocks fenced as ```mermaid are drawn as diagrams, as are unlabeled
+fences that start with a Mermaid diagram type (flowchart, sequenceDiagram, ...).
+
+With no flags, renders to a temp dir and opens the PDF for preview.
+Requires typst (brew install typst); printing also needs lp (CUPS).
+"""
+
+
+def die(msg, code=1):
+    print(f"mdprint: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(prog="mdprint", add_help=False)
+    p.add_argument("file", nargs="?")
+    p.add_argument("-p", "--print", dest="do_print", action="store_true")
+    p.add_argument("-P", "--printer")
+    p.add_argument("-n", "--copies", type=int, default=1)
+    p.add_argument("-d", "--duplex", action="store_true")
+    p.add_argument("-o", "--output")
+    p.add_argument("-r", "--recursive", action="store_true")
+    p.add_argument("--title", action="store_true")
+    p.add_argument("--open", action="store_true")
+    p.add_argument("-s", "--style")
+    p.add_argument("--paper", choices=["us-letter", "a4"], default="us-letter")
+    p.add_argument("--link-footnotes", dest="link_footnotes", action="store_true", default=None)
+    p.add_argument("--no-link-footnotes", dest="link_footnotes", action="store_false")
+    p.add_argument("--highlight", action="store_true")
+    p.add_argument("--color", action="store_true")
+    p.add_argument("--print-style", action="store_true")
+    p.add_argument("-h", "--help", action="store_true")
+    p.error = lambda msg: die(f"{msg}\nTry 'mdprint --help'.", 2)
+    args = p.parse_args(argv)
+    if args.printer:
+        args.do_print = True
+    if args.link_footnotes is None:
+        args.link_footnotes = args.do_print
+    if args.copies < 1:
+        die("--copies must be at least 1", 2)
+    return args
+
+
+def split_front_matter(text):
+    """Returns (title or None, body) with any leading YAML front matter removed."""
+    m = re.match(r"\A---[ \t]*\r?\n(.*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|\Z)", text, re.S)
+    if not m:
+        return None, text
+    title = None
+    for line in m.group(1).splitlines():
+        t = re.match(r"title:\s*(.*?)\s*$", line)
+        if t:
+            title = t.group(1)
+            if len(title) >= 2 and title[0] == title[-1] and title[0] in "\"'":
+                title = title[1:-1]
+            break
+    return title or None, text[m.end():]
+
+
+# cmarker crashes on <a> tags lacking href and only labels headings and figures
+# by id, so empty <a id> anchors become empty figures to keep #id links valid.
+BARE_ANCHOR = re.compile(r"<a\s+id=(\"[^\"]*\")\s*>\s*</a>", re.I)
+
+
+def typst_str(s):
+    # JSON escapes for quotes, backslashes and control chars are valid Typst.
+    return json.dumps(s, ensure_ascii=False)
+
+
+def wrapper(style_path, body_path):
+    # Root is "/", so absolute host paths double as root-relative Typst paths.
+    return f"""#import {typst_str(CMARKER)}: render
+#import {typst_str(str(style_path))}: mdprint
+#show: mdprint
+
+#let base = sys.inputs.base
+#let resolve(src) = if src.starts-with("/") {{ src }} else {{ base + "/" + src }}
+
+#render(
+  read({typst_str(str(body_path))}),
+  scope: (image: (src, ..args) => image(resolve(src), ..args)),
+)
+"""
+
+
+def drop_font_fallback_warnings(lines):
+    """Yields typst stderr lines minus "unknown font family" diagnostics.
+
+    Fallback lists name fonts that are expected to be missing on some systems.
+    A diagnostic runs from its header line through the next blank line.
+    """
+    skipping = False
+    for line in lines:
+        if line.startswith("warning: unknown font family"):
+            skipping = True
+        elif skipping and not line.strip():
+            skipping = False
+        elif not skipping:
+            yield line
+
+
+def open_pdfs(pdfs):
+    opener = "open" if platform.system() == "Darwin" else "xdg-open"
+    if not shutil.which(opener):
+        print(f"mdprint: no '{opener}' to open the PDF(s)", file=sys.stderr)
+        return
+    # xdg-open takes a single file.
+    for batch in ([pdfs] if opener == "open" else [[p] for p in pdfs]):
+        subprocess.Popen([opener, *map(str, batch)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cups(*cmd):
+    """Runs a CUPS query with untranslated output; None if it fails."""
+    result = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, "LC_ALL": "C"})
+    return result.stdout if result.returncode == 0 else None
+
+
+def parse_printers(lpstat_l_p):
+    """Maps queue name -> description from `lpstat -l -p` output."""
+    printers = {}
+    queue = None
+    for line in lpstat_l_p.splitlines():
+        if m := re.match(r"printer (\S+) ", line):
+            queue = m.group(1)
+            printers[queue] = queue
+        elif queue and (m := re.match(r"\s+Description: (.*\S)", line)):
+            printers[queue] = m.group(1)
+    return printers
+
+
+def macos_last_used_printer():
+    # Backs System Settings' "Last Printer Used", which CUPS doesn't see as a default.
+    out = subprocess.run(["defaults", "export", "org.cups.PrintingPrefs", "-"], capture_output=True)
+    if out.returncode != 0:
+        return None
+    try:
+        prefs = plistlib.loads(out.stdout)
+    except plistlib.InvalidFileException:
+        return None
+    recent = prefs.get("LastUsedPrinters") or [{}]
+    return recent[0].get("PrinterID")
+
+
+def match_printer(name, printers):
+    """Finds the queue for NAME, given as a queue name or description, loosely."""
+    if name in printers:
+        return [name]
+    squash = lambda s: re.sub(r"[^a-z0-9]", "", s.casefold())
+    for same in (str.casefold, squash):
+        exact = [q for q, d in printers.items() if same(name) in (same(q), same(d))]
+        if exact:
+            return exact
+    return [q for q, d in printers.items() if squash(name) in squash(q) or squash(name) in squash(d)]
+
+
+def resolve_printer(name):
+    """Returns the queue to print to, or dies explaining why there is none."""
+    listing = cups("lpstat", "-l", "-p")
+    if listing is None:
+        # Can't enumerate printers; let lp judge the name (or pick its default).
+        return name
+    printers = parse_printers(listing)
+    available = "\n".join(f"  {d}" + (f"  ({q})" if d != q else "") for q, d in printers.items())
+    if not printers:
+        die("no printers are set up")
+    if name:
+        found = match_printer(name, printers)
+        if len(found) == 1:
+            return found[0]
+        problem = f"'{name}' matches several printers" if found else f"no printer matches '{name}'"
+        die(f"{problem}; available:\n{available}")
+
+    default = cups("lpstat", "-d") or ""
+    if m := re.match(r"system default destination: (\S+)", default):
+        return m.group(1)
+    if platform.system() == "Darwin" and (last := macos_last_used_printer()) in printers:
+        return last
+    if len(printers) == 1:
+        return next(iter(printers))
+    die(f"no default printer; pick one with -P, or set a default with 'lpadmin -d QUEUE':\n{available}")
+
+
+def send_to_printer(pdf, args, job_title):
+    cmd = ["lp", "-n", str(args.copies), "-t", job_title]
+    if args.printer:
+        cmd += ["-d", args.printer]
+    if args.duplex:
+        cmd += ["-o", "sides=two-sided-long-edge"]
+    return subprocess.run(cmd + [str(pdf)]).returncode == 0
+
+
+def collect_sources(path, recursive):
+    """Returns the Markdown files at PATH, which may be a file or a directory."""
+    if path.is_file():
+        return [path]
+    if not path.is_dir():
+        die(f"no such file or directory: {path}")
+    pattern = "**/*" if recursive else "*"
+    found = [
+        p for p in path.glob(pattern)
+        if p.is_file() and p.suffix.lower() in MARKDOWN_SUFFIXES
+        and not any(part.startswith(".") for part in p.relative_to(path).parts)
+    ]
+    if not found:
+        hint = "" if recursive else " (use -r to include subdirectories)"
+        die(f"no Markdown files in {path}{hint}")
+    return sorted(found, key=lambda p: [part.lower() for part in p.relative_to(path).parts])
+
+
+def render(src, pdf, args, workdir, style):
+    """Compiles SRC to PDF; returns the front-matter title, or False on failure."""
+    title, body = split_front_matter(src.read_text(encoding="utf-8"))
+    workdir.mkdir()
+    body_path = workdir / "body.md"
+    body_path.write_text(BARE_ANCHOR.sub(r"<figure id=\1></figure>", body), encoding="utf-8")
+    main = workdir / "main.typ"
+    main.write_text(wrapper(style, body_path), encoding="utf-8")
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+
+    inputs = {
+        "base": str(src.parent),
+        "paper": args.paper,
+        "highlight": str(args.highlight).lower(),
+        "color": str(args.color).lower(),
+        "link-footnotes": str(args.link_footnotes).lower(),
+        "show-title": str(args.title).lower(),
+        "filename": src.name,
+    }
+    if title:
+        inputs["title"] = title
+    cmd = ["typst", "compile", "--root", "/"]
+    for k, v in inputs.items():
+        cmd += ["--input", f"{k}={v}"]
+    # Streamed so first-run package download progress shows as it happens.
+    with subprocess.Popen(cmd + [str(main), str(pdf)], stderr=subprocess.PIPE, text=True) as proc:
+        for line in drop_font_fallback_warnings(proc.stderr):
+            sys.stderr.write(line)
+    if proc.returncode != 0:
+        print(f"mdprint: typst failed to compile {src}", file=sys.stderr)
+        return False
+    return title
+
+
+def keep(pdfs, staging):
+    """Moves PDFs out of STAGING in the temp dir so they survive its cleanup."""
+    dest = Path(tempfile.mkdtemp(prefix="mdprint-"))
+    moved = []
+    for pdf in pdfs:
+        target = dest / pdf.relative_to(staging)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(pdf, target)
+        moved.append(target)
+    return moved
+
+
+def run(args, workdir):
+    path = Path(args.file).expanduser().resolve()
+    sources = collect_sources(path, args.recursive)
+    batch = path.is_dir()
+
+    if args.style:
+        style = Path(args.style).expanduser().resolve()
+        if not style.is_file():
+            die(f"no such style file: {args.style}")
+    else:
+        style = workdir / "style.typ"
+        style.write_text(STYLE, encoding="utf-8")
+
+    # A directory's layout is mirrored, so same-named files can't collide.
+    out = Path(args.output).expanduser().resolve() if args.output else None
+    staging = workdir / "pdf"
+    jobs = []
+    for src in sources:
+        rel = src.relative_to(path).with_suffix(".pdf") if batch else Path(f"{src.stem}.pdf")
+        pdf = out if out and not batch else (out or staging) / rel
+        jobs.append((src, pdf))
+
+    # Render everything before printing anything, so a bad file can't leave a
+    # half-printed set.
+    titles = [render(src, pdf, args, workdir / f"build-{i}", style) for i, (src, pdf) in enumerate(jobs)]
+    if False in titles:
+        if not batch:
+            sys.exit(1)
+        failed = sum(t is False for t in titles)
+        die(f"{failed} of {len(jobs)} file(s) failed to compile; nothing printed" if args.do_print
+            else f"{failed} of {len(jobs)} file(s) failed to compile")
+
+    pdfs = [pdf for _, pdf in jobs]
+    if args.do_print:
+        for n, ((src, pdf), title) in enumerate(zip(jobs, titles)):
+            if not send_to_printer(pdf, args, title or src.name):
+                unprinted = pdfs[n:] if out else keep(pdfs[n:], staging)
+                die("printing failed; unprinted PDF(s) kept at:\n  " + "\n  ".join(map(str, unprinted)))
+        if out:
+            print("\n".join(map(str, pdfs)))
+    else:
+        if not out:
+            # The viewer needs the PDFs after we exit, so they outlive the temp dir.
+            pdfs = keep(pdfs, staging)
+        print("\n".join(map(str, pdfs)))
+
+    if args.open or (not args.do_print and not out):
+        open_pdfs(pdfs)
+
+
+def main(argv):
+    args = parse_args(argv)
+    if args.help:
+        sys.stdout.write(HELP)
+        return
+    if args.print_style:
+        sys.stdout.write(STYLE)
+        return
+    if not args.file:
+        die("missing PATH\nTry 'mdprint --help'.", 2)
+    if not shutil.which("typst"):
+        die("typst not found; install it with: brew install typst")
+    if args.do_print and not shutil.which("lp"):
+        die("lp not found; printing needs CUPS (macOS has it; on Linux install cups-client)")
+    if args.do_print:
+        args.printer = resolve_printer(args.printer)
+
+    # Turn SIGTERM/SIGHUP into SystemExit so the temp dir is removed on the way out.
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, lambda signum, _: sys.exit(128 + signum))
+    try:
+        with tempfile.TemporaryDirectory(prefix="mdprint-") as workdir:
+            run(args, Path(workdir))
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
